@@ -1,0 +1,6 @@
+<?xml version='1.0' encoding='utf-8'?>
+<tv generator-info-name="TVN14-Weekly-EPG" source-info-url="https://www.tvn14.com/parrilla-de-programacion/">
+ <channel id="tvn14.cr">
+  <display-name lang="es">TVN Canal 14</display-name>
+ </channel>
+</tv>
