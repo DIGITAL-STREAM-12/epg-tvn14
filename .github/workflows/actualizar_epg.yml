@@ -2,15 +2,14 @@ name: Actualizar EPG TVN14
 
 on:
   schedule:
-    # Se ejecuta todos los días a las 06:00 UTC (puedes ajustar el cron según prefieras)
-    - cron: '0 6 * * *'
-  workflow_dispatch: # Permite ejecutar el script manualmente desde la pestaña "Actions" de GitHub
+    - cron: '0 6 * * *' # Se ejecuta todos los días a las 06:00 UTC
+  workflow_dispatch: # Permite ejecución manual desde la pestaña Actions
 
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # Permite al bot hacer commit y push de los archivos actualizados
+      contents: write # Permite al bot hacer commit y push
 
     steps:
       - name: Clonar repositorio
@@ -34,5 +33,4 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add epg_tvn14_semanal.xml epg_tvn14_semanal.json
-          # Si hay cambios, realiza el commit y push; si no, no hace nada
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Actualización automática EPG TVN14 [skip ci]" && git push)
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Actualización automática EPG TVN14 [skip ci]" && git push origin HEAD)
