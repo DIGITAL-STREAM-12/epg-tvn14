@@ -260,20 +260,10 @@ def guardar_xmltv_semanal(programas: list[dict], ruta_archivo: str) -> None:
 
 
 if __name__ == "__main__":
-    # Prueba primero con un solo día para depurar
-    print("Probando extracción de lunes...")
-    try:
-        parrilla_lunes = obtener_parrilla_dia("lunes", lunes_de_semana_actual())
-        print(f"Programas encontrados para el lunes: {len(parrilla_lunes)}")
-        if len(parrilla_lunes) == 0:
-            # Imprime las primeras líneas extraídas de la web para ver cómo cambió el formato
-            resp = requests.get(URLS_DIAS["lunes"], headers={"User-Agent": "Mozilla/5.0"})
-            soup = BeautifulSoup(resp.text, "html.parser")
-            main = soup.find("main") or soup.body
-            print("Primeras 30 líneas detectadas en el HTML:")
-            lineas = [txt.strip() for txt in main.stripped_strings if txt.strip()]
-            for l in lineas[:30]:
-                print(" -", l)
-    except Exception as e:
-        print("Error en la petición:", e
-        )
+    parrilla_semana = obtener_parrilla_semanal()
+    guardar_xmltv_semanal(parrilla_semana, "epg_tvn14_semanal.xml")
+    guardar_json_semanal(parrilla_semana, "epg_tvn14_semanal.json")
+    print(
+        f"Generado EPG semanal con {len(parrilla_semana)} programas en epg_tvn14_semanal.xml"
+    )
+    
