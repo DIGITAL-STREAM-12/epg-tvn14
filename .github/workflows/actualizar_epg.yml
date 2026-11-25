@@ -1,0 +1,38 @@
+name: Actualizar EPG TVN14
+
+on:
+  schedule:
+    # Se ejecuta todos los días a las 06:00 UTC (puedes ajustar el cron según prefieras)
+    - cron: '0 6 * * *'
+  workflow_dispatch: # Permite ejecutar el script manualmente desde la pestaña "Actions" de GitHub
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Permite al bot hacer commit y push de los archivos actualizados
+
+    steps:
+      - name: Clonar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Ejecutar script de EPG
+        run: python main.py
+
+      - name: Commit y Push de los cambios en el EPG
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add epg_tvn14_semanal.xml epg_tvn14_semanal.json
+          # Si hay cambios, realiza el commit y push; si no, no hace nada
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Actualización automática EPG TVN14 [skip ci]" && git push)
