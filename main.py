@@ -275,4 +275,5 @@ if __name__ == "__main__":
             for l in lineas[:30]:
                 print(" -", l)
     except Exception as e:
-        print("Error en la petición:", e)
+        print("Error en la petición:", e
+        )
