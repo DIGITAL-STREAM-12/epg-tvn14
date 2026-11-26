@@ -1,191 +1,386 @@
 from datetime import datetime, timedelta, timezone
-import json
 import re
-from typing import Optional
+import sys
+import time
+import unicodedata
 import xml.etree.ElementTree as ET
-from bs4 import BeautifulSoup
-import requests
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
 
-URLS_DIAS = {
-    "lunes": "https://www.tvn14.com/parrilla-de-programacion/",
-    "martes": "https://www.tvn14.com/parrilla-de-programacion-martes/",
-    "miercoles": "https://www.tvn14.com/parrilla-de-programacion-miercoles/",
-    "jueves": "https://www.tvn14.com/parrilla-de-programacion-jueves/",
-    "viernes": "https://www.tvn14.com/parrilla-de-programacion-viernes/",
-    "sabado": "https://www.tvn14.com/parrilla-de-programacion-sabado/",
-    "domingo": "https://www.tvn14.com/parrilla-de-programacion-domingo/",
-}
-
-DIAS_SEMANA = [
-    "lunes",
-    "martes",
-    "miercoles",
-    "jueves",
-    "viernes",
-    "sabado",
-    "domingo",
-]
-
+URL_PROGRAMACION = "https://www.tvn14.com/parrilla-de-programacion/"
 TZ_CR = timezone(timedelta(hours=-6))
 CHANNEL_ID = "tvn14.cr"
 CHANNEL_NAME = "TVN Canal 14"
+ARCHIVO_SALIDA = "epg_tvn14_diario.xml"
 
-FRANJAS = {"mañana", "tarde", "noche"}
+DIAS_SEMANA = [
+    "Lunes",
+    "Martes",
+    "Miércoles",
+    "Jueves",
+    "Viernes",
+    "Sábado",
+    "Domingo",
+]
+
 PATRON_HORA = re.compile(
-    r"\b(\d{1,2}:\d{2})\s*(am|pm|a\.m\.|p\.m\.|m|md)\b", re.IGNORECASE
+    r"\b(\d{1,2})(?::(\d{2}))?\s*(a\.?\s*m\.?|p\.?\s*m\.?|m\.?\s*d\.?|am|pm|md|m)?(?!\w)",
+    re.IGNORECASE,
 )
 
 
-def parsear_hora_24h(texto_hora: str) -> Optional[tuple[int, int]]:
-    """Convierte '6:00 am', '12:00 m', '12:00 md' o '8:30 pm' a (hora_24, minuto)."""
+def normalizar_texto(texto: str) -> str:
+    """Convierte a minúsculas, colapsa espacios y elimina tildes."""
+    limpio = re.sub(r"\s+", " ", texto).strip().lower()
+    return "".join(
+        c
+        for c in unicodedata.normalize("NFD", limpio)
+        if unicodedata.category(c) != "Mn"
+    )
+
+
+def parsear_hora_24h(texto_hora: str) -> tuple[int, int] | None:
+    """Convierte texto de hora (12h o 24h) a (hora_24, minuto)."""
     m = PATRON_HORA.search(texto_hora.strip())
     if not m:
         return None
 
-    hh_mm, periodo = m.group(1), m.group(2).lower().replace(".", "")
-    hora, minuto = map(int, hh_mm.split(":"))
+    hora = int(m.group(1))
+    min_str = m.group(2)
+    periodo_raw = m.group(3)
 
-    if periodo in ("m", "md"):
-        hora_24 = 12 if hora == 12 else hora
+    if min_str is None and not periodo_raw:
+        return None
+
+    minuto = int(min_str) if min_str is not None else 0
+    if not (0 <= minuto <= 59):
+        return None
+
+    if not periodo_raw:
+        return (hora, minuto) if 0 <= hora <= 23 else None
+
+    periodo = re.sub(r"[\s.]", "", periodo_raw).lower()
+    if periodo == "md" or (periodo == "m" and min_str is not None):
+        if hora != 12:
+            return None
+        hora_24 = 12
     elif periodo == "am":
+        if not (1 <= hora <= 12):
+            return None
         hora_24 = 0 if hora == 12 else hora
-    else: # pm
+    elif periodo == "pm":
+        if not (1 <= hora <= 12):
+            return None
         hora_24 = hora if hora == 12 else hora + 12
+    else:
+        return None
 
-    return (hora_24, minuto)
-
-
-def lunes_de_semana_actual(referencia: Optional[datetime] = None) -> datetime:
-    """Devuelve el lunes (00:00:00, -06:00) de la semana correspondiente a la fecha dada."""
-    actual = referencia or datetime.now(TZ_CR)
-    lunes = actual - timedelta(days=actual.weekday())
-    return lunes.replace(hour=0, minute=0, second=0, microsecond=0)
+    return (hora_24, minuto) if 0 <= hora_24 <= 23 else None
 
 
-def fecha_para_dia_en_semana(dia: str, lunes_base: datetime) -> datetime:
-    """Calcula la fecha exacta del día dentro de la semana iniciada en lunes_base."""
-    indice = DIAS_SEMANA.index(dia)
-    return lunes_base + timedelta(days=indice)
+def extraer_horas_y_titulo(
+    linea: str,
+) -> tuple[tuple[int, int], tuple[int, int] | None, str] | None:
+    """Extrae (inicio_24, fin_24_opcional, titulo) desde una línea de texto."""
+    matches = [
+        m for m in PATRON_HORA.finditer(linea)
+        if parsear_hora_24h(m.group(0)) is not None
+    ]
+    if not matches:
+        return None
+
+    m_ini = matches[0]
+    ini_24 = parsear_hora_24h(m_ini.group(0))
+    if not ini_24:
+        return None
+
+    fin_24 = None
+    corte_fin = m_ini.end()
+
+    if len(matches) >= 2:
+        entre = linea[m_ini.end():matches[1].start()].strip().lower()
+        if entre in ("-", "–", "—", "a", "al", "hasta", "/"):
+            fin_24 = parsear_hora_24h(matches[1].group(0))
+            corte_fin = matches[1].end()
+
+    resto = (linea[:m_ini.start()] + " " + linea[corte_fin:]).strip(" -–—:|/\t\n")
+    resto = re.sub(r"\s+", " ", resto).strip()
+    return ini_24, fin_24, resto
 
 
-def _buscar_titulo_cercano(
-    lineas: list[str], idx: int, hacia_atras: bool = True
-) -> Optional[str]:
-    desplazamientos = range(1, 5) if hacia_atras else range(1, 3)
-    for step in desplazamientos:
-        pos = idx - step if hacia_atras else idx + step
-        if pos < 0 or pos >= len(lineas):
-            break
-        candidato = lineas[pos]
-        if candidato.lower() in FRANJAS or PATRON_HORA.search(candidato):
+def esperar_superar_sgcaptcha(page, timeout_seg: int = 45) -> None:
+    """Espera a que Playwright resuelva el reto sg-captcha de SiteGround si aparece."""
+    inicio = time.monotonic()
+    while time.monotonic() - inicio < timeout_seg:
+        titulo = ""
+        contenido = ""
+        try:
+            titulo = page.title()
+            contenido = page.content()
+        except Exception:
+            time.sleep(0.8)
             continue
-        if re.fullmatch(r"[a-z0-9-]+", candidato) and "-" in candidato:
-            continue
-        return candidato
+
+        en_reto = (
+            "Robot Challenge Screen" in titulo
+            or "sgchallenge" in contenido
+            or "/.well-known/sgcaptcha" in page.url
+            or "Checking the site connection security" in contenido
+        )
+        if not en_reto and len(contenido) > 1500:
+            return
+
+        time.sleep(1.0)
+
+    raise TimeoutError("Tiempo agotado esperando la resolución del reto anti-bot sg-captcha.")
+
+
+def seleccionar_pestana_dia(page, dia_objetivo: str) -> str | None:
+    """Busca y hace clic en la pestaña/botón del día actual. Devuelve aria-controls si existe."""
+    clave_obj = normalizar_texto(dia_objetivo)
+    abrev_obj = clave_obj[:3]
+
+    resultado = page.evaluate(
+        """
+        ({ claveObj, abrevObj }) => {
+            const normalizar = (s) => (s || "")
+                .normalize("NFD")
+                .replace(/[\\u0300-\\u036f]/g, "")
+                .replace(/\\s+/g, " ")
+                .trim()
+                .toLowerCase();
+
+            const esVisible = (el) => {
+                if (!el) return false;
+                const st = window.getComputedStyle(el);
+                if (st.display === "none" || st.visibility === "hidden" || st.opacity === "0") {
+                    return false;
+                }
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            };
+
+            const selectores = [
+                "main button, main [role='tab'], main a, main .elementor-tab-title, main li, main label",
+                "article button, article [role='tab'], article a, article .elementor-tab-title, article li, article label",
+                "button, [role='tab'], .elementor-tab-title, a, li, label"
+            ];
+
+            for (const sel of selectores) {
+                const candidatos = Array.from(document.querySelectorAll(sel));
+                const match = candidatos.find((el) => {
+                    if (!esVisible(el)) return false;
+                    if (el.closest("header, nav, footer")) return false;
+                    const txt = normalizar(el.innerText || el.textContent);
+                    if (!txt || txt.length > 25) return false;
+                    return txt === claveObj || txt === abrevObj || txt.startsWith(claveObj + " ");
+                });
+                if (match) {
+                    match.scrollIntoView({ behavior: "instant", block: "center" });
+                    match.click();
+                    return {
+                        clicked: true,
+                        text: match.innerText,
+                        ariaControls: match.getAttribute("aria-controls") || null,
+                    };
+                }
+            }
+            return { clicked: false, text: null, ariaControls: null };
+        }
+        """,
+        {"claveObj": clave_obj, "abrevObj": abrev_obj},
+    )
+
+    if resultado and resultado.get("clicked"):
+        page.wait_for_timeout(800)
+        return resultado.get("ariaControls")
+
+    print(f"[Aviso] No se encontró pestaña explícita para '{dia_objetivo}'; se leerá el contenido visible.")
     return None
 
 
-def obtener_parrilla_dia(dia: str, fecha_base: datetime) -> list[dict]:
-    """Extrae y ordena la programación de un día asignándole fecha_base."""
-    dia = dia.lower().strip()
-    url = URLS_DIAS.get(dia)
-    if not url:
-        raise ValueError(f"Día no válido: {dia}")
+def extraer_lineas_visibles(page, aria_controls: str | None) -> list[str]:
+    """Extrae líneas visibles exclusivamente del panel activo o contenido principal."""
+    return page.evaluate(
+        """
+        (ariaControls) => {
+            let raiz = null;
+            if (ariaControls) {
+                const panel = document.getElementById(ariaControls);
+                if (panel) raiz = panel;
+            }
 
-    resp = requests.get(
-        url,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; ParrillaEPGBot/1.0)"},
-        timeout=20,
+            if (!raiz) {
+                const panelesActivos = Array.from(document.querySelectorAll(
+                    ".elementor-tab-content.elementor-active, [role='tabpanel']:not([hidden]):not([aria-hidden='true']), .tab-pane.active, .ui-tabs-panel"
+                )).filter((el) => {
+                    const st = window.getComputedStyle(el);
+                    const r = el.getBoundingClientRect();
+                    return st.display !== "none" && st.visibility !== "hidden" && r.width > 0 && r.height > 0;
+                });
+
+                if (panelesActivos.length === 1) {
+                    raiz = panelesActivos[0];
+                } else if (panelesActivos.length > 1) {
+                    const lineas = [];
+                    for (const p of panelesActivos) {
+                        for (const tr of p.querySelectorAll("tr")) {
+                            const st = window.getComputedStyle(tr);
+                            if (st.display === "none" || st.visibility === "hidden") continue;
+                            const celdas = Array.from(tr.querySelectorAll("th, td"))
+                                .map((c) => (c.innerText || "").replace(/\\s+/g, " ").trim())
+                                .filter(Boolean);
+                            if (celdas.length) lineas.push(celdas.join(" | "));
+                        }
+                        const txt = (p.innerText || "").split(/\\n+/).map((l) => l.trim()).filter(Boolean);
+                        lineas.push(...txt);
+                    }
+                    return lineas;
+                }
+            }
+
+            if (!raiz) {
+                raiz = document.querySelector("main, article, .entry-content") || document.body;
+            }
+
+            const lineas = [];
+            const tablas = Array.from(raiz.querySelectorAll("table")).filter((t) => {
+                const st = window.getComputedStyle(t);
+                const r = t.getBoundingClientRect();
+                return st.display !== "none" && st.visibility !== "hidden" && r.width > 0 && r.height > 0;
+            });
+
+            if (tablas.length > 0) {
+                for (const tabla of tablas) {
+                    for (const tr of tabla.querySelectorAll("tr")) {
+                        const st = window.getComputedStyle(tr);
+                        if (st.display === "none" || st.visibility === "hidden") continue;
+                        const celdas = Array.from(tr.querySelectorAll("th, td"))
+                            .map((c) => (c.innerText || "").replace(/\\s+/g, " ").trim())
+                            .filter(Boolean);
+                        if (celdas.length) {
+                            lineas.push(celdas.join(" | "));
+                        }
+                    }
+                }
+                if (lineas.length > 0) return lineas;
+            }
+
+            const texto = raiz.innerText || "";
+            return texto.split(/\\n+/).map((l) => l.replace(/\\s+/g, " ").trim()).filter(Boolean);
+        }
+        """,
+        aria_controls,
     )
-    resp.raise_for_status()
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    main = soup.find("main") or soup.body or soup
 
-    lineas = [
-        re.sub(r"\s+", " ", txt).strip()
-        for txt in main.stripped_strings
-        if re.sub(r"\s+", " ", txt).strip()
-    ]
+def obtener_parrilla_tvn14() -> list[dict]:
+    """Navega con Chromium headless, selecciona el día actual y construye la parrilla."""
+    hoy = datetime.now(TZ_CR).replace(hour=0, minute=0, second=0, microsecond=0)
+    dia_actual = DIAS_SEMANA[hoy.weekday()]
 
-    franja_actual = "General"
-    programas = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            locale="es-CR",
+            timezone_id="America/Costa_Rica",
+            viewport={"width": 1366, "height": 900},
+        )
+        context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
+        page = context.new_page()
+
+        try:
+            page.goto(URL_PROGRAMACION, wait_until="domcontentloaded", timeout=60000)
+            esperar_superar_sgcaptcha(page, timeout_seg=45)
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except PlaywrightTimeoutError:
+                pass
+
+            aria_controls = seleccionar_pestana_dia(page, dia_actual)
+            lineas = extraer_lineas_visibles(page, aria_controls)
+            url_final = page.url
+            titulo_pag = page.title()
+        finally:
+            browser.close()
+
+    dias_norm = {normalizar_texto(d) for d in DIAS_SEMANA}
+    programas_crudos = []
     vistos = set()
 
-    for i, linea in enumerate(lineas):
-        baja = linea.lower()
-        if baja in FRANJAS:
-            franja_actual = linea.capitalize()
+    i = 0
+    while i < len(lineas):
+        linea = lineas[i]
+        if normalizar_texto(linea) in dias_norm:
+            i += 1
             continue
 
-        if "/" in linea and PATRON_HORA.search(linea):
-            partes = linea.split("/", 1)
-            inicio = parsear_hora_24h(partes[0])
-            fin = parsear_hora_24h(partes[1])
-            if not inicio:
-                continue
+        parsed = extraer_horas_y_titulo(linea)
+        if parsed:
+            ini_24, fin_24, titulo = parsed
+            if len(titulo) < 2:
+                for offset in range(1, 3):
+                    if i + offset < len(lineas):
+                        sig = lineas[i + offset]
+                        if (
+                            sig
+                            and normalizar_texto(sig) not in dias_norm
+                            and not extraer_horas_y_titulo(sig)
+                        ):
+                            titulo = sig
+                            i += offset
+                            break
 
-            titulo = _buscar_titulo_cercano(lineas, i, hacia_atras=True)
-            if titulo:
-                clave = (inicio, titulo.lower())
+            if titulo and len(titulo) >= 2:
+                clave = (ini_24, titulo.lower())
                 if clave not in vistos:
                     vistos.add(clave)
-                    programas.append(
+                    programas_crudos.append(
                         {
-                            "franja": franja_actual,
-                            "inicio_24": inicio,
-                            "fin_24": fin,
+                            "inicio_24": ini_24,
+                            "fin_24": fin_24,
                             "programa": titulo,
                         }
                     )
+        i += 1
 
-        elif PATRON_HORA.fullmatch(linea):
-            inicio = parsear_hora_24h(linea)
-            if not inicio:
-                continue
-            if i + 2 < len(lineas) and "/" in lineas[i + 2]:
-                continue
+    programas_crudos.sort(key=lambda x: (x["inicio_24"][0], x["inicio_24"][1]))
 
-            titulo = _buscar_titulo_cercano(lineas, i, hacia_atras=False)
-            if titulo:
-                clave = (inicio, titulo.lower())
-                if clave not in vistos:
-                    vistos.add(clave)
-                    programas.append(
-                        {
-                            "franja": franja_actual,
-                            "inicio_24": inicio,
-                            "fin_24": None,
-                            "programa": titulo,
-                        }
-                    )
-
-    programas.sort(key=lambda item: item["inicio_24"])
+    if not programas_crudos:
+        print(f"[Error] No se detectaron programas. URL='{url_final}', Título='{titulo_pag}'")
+        return []
 
     resultado = []
-    for idx, item in enumerate(programas):
+    for idx, item in enumerate(programas_crudos):
         h_ini, m_ini = item["inicio_24"]
-        dt_inicio = fecha_base.replace(hour=h_ini, minute=m_ini)
+        dt_inicio = hoy.replace(hour=h_ini, minute=m_ini)
 
         if item["fin_24"]:
             h_fin, m_fin = item["fin_24"]
-            dt_fin = fecha_base.replace(hour=h_fin, minute=m_fin)
+            dt_fin = hoy.replace(hour=h_fin, minute=m_fin)
             if dt_fin <= dt_inicio:
                 dt_fin += timedelta(days=1)
-        elif idx + 1 < len(programas):
-            h_sig, m_sig = programas[idx + 1]["inicio_24"]
-            dt_fin = fecha_base.replace(hour=h_sig, minute=m_sig)
+        elif idx + 1 < len(programas_crudos):
+            h_sig, m_sig = programas_crudos[idx + 1]["inicio_24"]
+            dt_fin = hoy.replace(hour=h_sig, minute=m_sig)
+            if dt_fin <= dt_inicio:
+                dt_fin += timedelta(days=1)
         else:
-            dt_fin = (fecha_base + timedelta(days=1)).replace(hour=0, minute=0)
+            dt_fin = dt_inicio + timedelta(hours=1)
 
         resultado.append(
             {
                 "channel_id": CHANNEL_ID,
-                "dia": dia,
-                "franja": item["franja"],
                 "programa": item["programa"],
-                "inicio_iso": dt_inicio.isoformat(),
-                "fin_iso": dt_fin.isoformat(),
                 "inicio_xmltv": dt_inicio.strftime("%Y%m%d%H%M%S %z"),
                 "fin_xmltv": dt_fin.strftime("%Y%m%d%H%M%S %z"),
             }
@@ -194,43 +389,12 @@ def obtener_parrilla_dia(dia: str, fecha_base: datetime) -> list[dict]:
     return resultado
 
 
-def obtener_parrilla_semanal(
-    lunes_base: Optional[datetime] = None,
-) -> list[dict]:
-    """Combina los 7 días de la semana en una sola lista cronológica."""
-    base = lunes_base or lunes_de_semana_actual()
-    semanal: list[dict] = []
-
-    for dia in DIAS_SEMANA:
-        fecha_dia = fecha_para_dia_en_semana(dia, base)
-        try:
-            items_dia = obtener_parrilla_dia(dia, fecha_dia)
-            semanal.extend(items_dia)
-        except requests.RequestException as exc:
-            print(f"[Aviso] No se pudo obtener {dia} ({fecha_dia.date()}): {exc}")
-
-    semanal.sort(key=lambda p: p["inicio_iso"])
-    return semanal
-
-
-def guardar_json_semanal(programas: list[dict], ruta_archivo: str) -> None:
-    payload = {
-        "canal": CHANNEL_NAME,
-        "channel_id": CHANNEL_ID,
-        "generado_en": datetime.now(TZ_CR).isoformat(),
-        "total_programas": len(programas),
-        "programacion": programas,
-    }
-    with open(ruta_archivo, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-
-
-def guardar_xmltv_semanal(programas: list[dict], ruta_archivo: str) -> None:
+def guardar_xmltv(programas: list[dict], ruta_archivo: str = ARCHIVO_SALIDA) -> None:
     tv = ET.Element(
         "tv",
         {
-            "generator-info-name": "TVN14-Weekly-EPG",
-            "source-info-url": "https://www.tvn14.com/parrilla-de-programacion/",
+            "generator-info-name": "TVN14-Daily-EPG",
+            "source-info-url": URL_PROGRAMACION,
         },
     )
 
@@ -245,24 +409,25 @@ def guardar_xmltv_semanal(programas: list[dict], ruta_archivo: str) -> None:
             {
                 "start": item["inicio_xmltv"],
                 "stop": item["fin_xmltv"],
-                "channel": CHANNEL_ID,
+                "channel": item["channel_id"],
             },
         )
         title = ET.SubElement(prog, "title", {"lang": "es"})
         title.text = item["programa"]
 
-        category = ET.SubElement(prog, "category", {"lang": "es"})
-        category.text = item["franja"]
+    if hasattr(ET, "indent"):
+        ET.indent(tv, space="  ")
 
-    ET.indent(tv, space=" ")
     tree = ET.ElementTree(tv)
     tree.write(ruta_archivo, encoding="utf-8", xml_declaration=True)
 
 
 if __name__ == "__main__":
-    parrilla_semana = obtener_parrilla_semanal()
-    guardar_xmltv_semanal(parrilla_semana, "epg_tvn14_semanal.xml")
-    guardar_json_semanal(parrilla_semana, "epg_tvn14_semanal.json")
-    print(
-        f"Generado EPG semanal con {len(parrilla_semana)} programas en epg_tvn14_semanal.xml"
-    )
+    print("Obteniendo programación diaria de TVN Canal 14...")
+    parrilla = obtener_parrilla_tvn14()
+    if not parrilla:
+        print("No se pudo generar el EPG. Revisa la estructura de la web.")
+        sys.exit(1)
+
+    guardar_xmltv(parrilla, ARCHIVO_SALIDA)
+    print(f"EPG generado con {len(parrilla)} programas en '{ARCHIVO_SALIDA}'.")
