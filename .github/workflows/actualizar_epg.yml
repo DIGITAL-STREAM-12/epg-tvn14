@@ -2,7 +2,7 @@ name: Actualizar EPG TVN 14
 
 on:
   schedule:
-    - cron: '0 6 * * *' # Todos los días a las 06:00 UTC (00:00 hora de Costa Rica)
+    - cron: '0 6 * * *' # Todos los días a las 06:00 UTC (00:00 en Costa Rica)
   workflow_dispatch: # Permite ejecución manual desde la pestaña Actions
 
 jobs:
@@ -40,9 +40,9 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add epg_tvn14_diario.xml
+          git add epg_tvn14.xml
           if ! git diff --staged --quiet; then
-            git commit -m "Actualización automática EPG diario TVN 14 [skip ci]"
+            git commit -m "Actualización automática EPG 3 días TVN 14 [skip ci]"
             git push origin HEAD
           else
             echo "No hay cambios en el archivo EPG."
