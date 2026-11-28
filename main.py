@@ -13,7 +13,8 @@ URL_PROGRAMACION = "https://www.tvn14.com/parrilla-de-programacion/"
 TZ_CR = timezone(timedelta(hours=-6))
 CHANNEL_ID = "tvn14.cr"
 CHANNEL_NAME = "TVN Canal 14"
-ARCHIVO_SALIDA = "epg_tvn14_diario.xml"
+ARCHIVO_SALIDA = "epg_tvn14.xml"
+DIAS_A_RECOPILAR = 3
 
 DIAS_SEMANA = [
     "Lunes",
@@ -119,7 +120,6 @@ def extraer_horas_y_titulo(
             corte_fin = matches[1].end()
             periodo_fin = matches[1].group(3)
 
-    # Si el rango solo trae am/pm/md al final (ej: "1:00 - 2:00 p.m."), propagarlo al inicio
     if m_ini.group(3) is None and periodo_fin:
         p_norm = re.sub(r"[\s.]", "", periodo_fin).lower()
         h_ini_raw = int(m_ini.group(1))
@@ -171,7 +171,7 @@ def esperar_superar_sgcaptcha(page, timeout_seg: int = 45) -> None:
 
 
 def seleccionar_pestana_dia(page, dia_objetivo: str) -> str | None:
-    """Busca y hace clic en la pestaña/botón del día actual. Devuelve aria-controls si existe."""
+    """Busca y hace clic en la pestaña/botón del día indicado. Devuelve aria-controls si existe."""
     clave_obj = normalizar_texto(dia_objetivo)
     abrev_obj = clave_obj[:3]
 
@@ -230,7 +230,7 @@ def seleccionar_pestana_dia(page, dia_objetivo: str) -> str | None:
         page.wait_for_timeout(1200)
         return resultado.get("ariaControls")
 
-    print(f"[Aviso] No se encontró pestaña explícita para '{dia_objetivo}'; se usará el panel visible.")
+    print(f"[Aviso] No se encontró pestaña explícita para '{dia_objetivo}'.")
     return None
 
 
@@ -303,8 +303,7 @@ def extraer_lineas_panel(page, panel) -> list[str]:
 
         try:
             png_bytes = img_loc.screenshot(type="png")
-            lineas_ocr = ocr_desde_bytes_png(png_bytes)
-            lineas.extend(lineas_ocr)
+            lineas.extend(ocr_desde_bytes_png(png_bytes))
             capturas_realizadas += 1
         except Exception as err:
             print(f"[Aviso] No se pudo capturar/leer la imagen #{idx}: {err}")
@@ -328,48 +327,8 @@ def extraer_lineas_panel(page, panel) -> list[str]:
     return lineas
 
 
-def obtener_parrilla_tvn14() -> list[dict]:
-    """Navega con Chromium headless, selecciona el día actual, aplica OCR y construye la parrilla."""
-    hoy = datetime.now(TZ_CR).replace(hour=0, minute=0, second=0, microsecond=0)
-    dia_actual = DIAS_SEMANA[hoy.weekday()]
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
-            locale="es-CR",
-            timezone_id="America/Costa_Rica",
-            viewport={"width": 1366, "height": 900},
-            device_scale_factor=2,
-        )
-        context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-        )
-        page = context.new_page()
-
-        try:
-            page.goto(URL_PROGRAMACION, wait_until="domcontentloaded", timeout=60000)
-            esperar_superar_sgcaptcha(page, timeout_seg=45)
-            try:
-                page.wait_for_load_state("networkidle", timeout=15000)
-            except PlaywrightTimeoutError:
-                pass
-
-            aria_controls = seleccionar_pestana_dia(page, dia_actual)
-            panel = localizar_panel_activo(page, aria_controls)
-            lineas = extraer_lineas_panel(page, panel)
-            url_final = page.url
-            titulo_pag = page.title()
-        finally:
-            browser.close()
-
+def parsear_programas_dia(lineas: list[str], fecha_dia: datetime) -> list[dict]:
+    """Convierte las líneas extraídas de un día en registros XMLTV con fecha exacta."""
     dias_norm = {normalizar_texto(d) for d in DIAS_SEMANA}
     programas_crudos = []
     vistos = set()
@@ -411,27 +370,22 @@ def obtener_parrilla_tvn14() -> list[dict]:
         i += 1
 
     programas_crudos.sort(key=lambda x: (x["inicio_24"][0], x["inicio_24"][1]))
-
     if not programas_crudos:
-        print(
-            f"[Error] No se detectaron programas. URL='{url_final}', "
-            f"Título='{titulo_pag}', Líneas OCR={lineas[:15]}"
-        )
         return []
 
     resultado = []
     for idx, item in enumerate(programas_crudos):
         h_ini, m_ini = item["inicio_24"]
-        dt_inicio = hoy.replace(hour=h_ini, minute=m_ini)
+        dt_inicio = fecha_dia.replace(hour=h_ini, minute=m_ini)
 
         if item["fin_24"]:
             h_fin, m_fin = item["fin_24"]
-            dt_fin = hoy.replace(hour=h_fin, minute=m_fin)
+            dt_fin = fecha_dia.replace(hour=h_fin, minute=m_fin)
             if dt_fin <= dt_inicio:
                 dt_fin += timedelta(days=1)
         elif idx + 1 < len(programas_crudos):
             h_sig, m_sig = programas_crudos[idx + 1]["inicio_24"]
-            dt_fin = hoy.replace(hour=h_sig, minute=m_sig)
+            dt_fin = fecha_dia.replace(hour=h_sig, minute=m_sig)
             if dt_fin <= dt_inicio:
                 dt_fin += timedelta(days=1)
         else:
@@ -449,11 +403,68 @@ def obtener_parrilla_tvn14() -> list[dict]:
     return resultado
 
 
+def obtener_parrilla_tvn14(dias: int = DIAS_A_RECOPILAR) -> list[dict]:
+    """Navega con Chromium headless, recorre N días por pestaña y aplica OCR."""
+    hoy = datetime.now(TZ_CR).replace(hour=0, minute=0, second=0, microsecond=0)
+    resultado = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            locale="es-CR",
+            timezone_id="America/Costa_Rica",
+            viewport={"width": 1366, "height": 900},
+            device_scale_factor=2,
+        )
+        context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
+        page = context.new_page()
+
+        try:
+            page.goto(URL_PROGRAMACION, wait_until="domcontentloaded", timeout=60000)
+            esperar_superar_sgcaptcha(page, timeout_seg=45)
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except PlaywrightTimeoutError:
+                pass
+
+            for offset in range(dias):
+                fecha_dia = hoy + timedelta(days=offset)
+                dia_nombre = DIAS_SEMANA[fecha_dia.weekday()]
+
+                aria_controls = seleccionar_pestana_dia(page, dia_nombre)
+                panel = localizar_panel_activo(page, aria_controls)
+                lineas = extraer_lineas_panel(page, panel)
+
+                programas_dia = parsear_programas_dia(lineas, fecha_dia)
+                if not programas_dia:
+                    print(
+                        f"[Aviso] Sin programas para '{dia_nombre}'. "
+                        f"URL='{page.url}', Líneas OCR={lineas[:10]}"
+                    )
+                else:
+                    print(f"'{dia_nombre}' ({fecha_dia.date()}): {len(programas_dia)} programas.")
+                    resultado.extend(programas_dia)
+        finally:
+            browser.close()
+
+    return resultado
+
+
 def guardar_xmltv(programas: list[dict], ruta_archivo: str = ARCHIVO_SALIDA) -> None:
     tv = ET.Element(
         "tv",
         {
-            "generator-info-name": "TVN14-Daily-EPG",
+            "generator-info-name": "TVN14-EPG",
             "source-info-url": URL_PROGRAMACION,
         },
     )
@@ -483,8 +494,8 @@ def guardar_xmltv(programas: list[dict], ruta_archivo: str = ARCHIVO_SALIDA) -> 
 
 
 if __name__ == "__main__":
-    print("Obteniendo programación diaria de TVN Canal 14...")
-    parrilla = obtener_parrilla_tvn14()
+    print(f"Obteniendo programación de {DIAS_A_RECOPILAR} días de TVN Canal 14...")
+    parrilla = obtener_parrilla_tvn14(DIAS_A_RECOPILAR)
     if not parrilla:
         print("No se pudo generar el EPG. Revisa las líneas OCR registradas arriba.")
         sys.exit(1)
